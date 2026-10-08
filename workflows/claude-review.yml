@@ -1,0 +1,111 @@
+name: Claude PR Review
+
+# PR 五轴 AI 审查:产出机器可读 VERDICT 行,feature/ 分支合并门禁之一(对 fix/ 是参考意见)。
+# CI 硬门禁只有 ci 的 gate job;审查结论以评论里的 VERDICT 行为准,不是 check 状态。
+
+on:
+  pull_request:
+    # reopened:审查失败的 PR 无新推送时,可用 close/reopen 重触发(间隔 ≥12s 防去抖)
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: self-hosted
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    env:
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
+      # 模型名收进 Secrets:切模型只改 secret,不动代码
+      ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_HAIKU_MODEL }}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_SONNET_MODEL }}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_OPUS_MODEL }}
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    steps:
+      # 记录本 run 起点时间——下方结论哨兵只认「本 run 期间」发出的
+      # VERDICT 评论,close/reopen 重触发的 run 不会把上一轮的旧结论算进来。
+      - name: 记录 run 起点(供结论哨兵)
+        run: echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # 预装 Claude Code CLI:action 默认从 claude.ai/install.sh 下载,
+      # 该域名对部分地区 runner 出口 IP 封锁(App unavailable in region);npm 源可达。
+      # 路径改成你 runner 上的实际 node bin 目录。
+      - name: Install Claude Code CLI via npm
+        run: |
+          CLAUDE_BIN=$HOME/.local/bin/claude
+          if [ -x "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+            echo "claude 已在位,跳过安装(防多 runner 并发装同一 bin 撞 ETXTBSY)"
+          else
+            flock /tmp/claude-npm-install.lock -c 'npm install -g @anthropic-ai/claude-code'
+          fi
+
+      - name: Review PR
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 走仓库 GITHUB_TOKEN 发评论:action 默认的 GitHub App token 交换
+          # 在自托管 runner 上可能被 403 "Request not allowed" 拒,GITHUB_TOKEN 不受影响
+          github_token: ${{ github.token }}
+          # 指定预装 CLI 路径:action 检测到该输入即跳过自带下载安装
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
+          prompt: |
+            审查这个 PR 的代码变更,把结果作为一条 PR 评论发布。
+            审查重点(按优先级):
+            1. 潜在 bug 与边界情况
+            2. 是否符合 CLAUDE.md 的硬性约束(零占位字样、凭证不入库等)
+            3. 术语口径是否符合项目术语表(CONTEXT.md,如有)
+            4. 类型严格度/代码规范问题
+            5. **验收轴**:读 PR 正文关联的 issue(gh issue view),逐条核对其验收标准/复现路径——哪条未覆盖明确指出;根因聚合单要核对「关联现象清单」是否每条都有对应验证。无 issue 号的直管 PR 则核 PR 正文「## 验收标准」段
+            按严重程度分级列出问题(🔴 必须改 / 🟡 建议改 / 🔵 提示);未发现问题就明确说未发现问题。
+            **发布策略(硬性):先出结论,再深挖。**不要等审查全部完成才发评论——
+            大 PR(数百文件量级)可能审不完就被轮数上限截断,那样整轮工作会因「没有评论」而归零。
+            · 第一轮就先发出一条审查评论(基于当时已有的判断,末行给 VERDICT);
+            · 之后每完成一块深挖,**更新同一条评论**(gh api -X PATCH .../issues/comments/<id>,或等价方式),
+              **不要用追加评论**;
+            · 任何时刻,PR 的最新一条评论都必须是你当下的完整结论(含末行 VERDICT)。
+            **完成即结束(硬性):**你的工作有明确终点,不要为覆盖面穷尽式深挖。
+            核对完上面 5 个审查重点、并按发布策略把结论(含末行 VERDICT)写进最新那条评论之后,
+            即视为本轮完成,**主动结束**——不要继续逐文件扫描直到被轮数上限截断
+            (截断会让 run 判红,门禁只能靠评论兜底,不如正常结束干净)。
+            **机器可读结论行(硬性要求)**:评论最后一行必须单独输出 `VERDICT: PASS` 或 `VERDICT: FAIL`——存在任何「🔴 必须改」项就是 FAIL,否则(包括只有 🟡/🔵)是 PASS。此行供 S4 合并门禁做字符串匹配,必须逐字精确、独占一行、不放代码块里。
+            只审查与评论,不要修改代码。
+          claude_args: '--max-turns 120 --allowedTools "Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Read,Glob,Grep"'
+
+      # Verdict 哨兵(无结论兜底):run 结束时核对「本 run 期间」真的发出过含 VERDICT 行的评论。
+      # 真实事故:某 PR 的审查 run success(is_error:false)但零评论,
+      # 合并门禁只能读到旧 head 的 VERDICT: FAIL(幽灵返工)。此处无结论就补发标记评论
+      # 并把本步骤判红——run 状态与「无结论」一致,门禁与 verdict-head 绑定规则
+      # 都不会把旧结论当成当前 head 的。
+      # !cancelled():被新 push 抢占取消的 run 不判红也不发标记(新 head 的 run 已在跑,
+      # 本 run 无结论是正常现象)。
+      - name: Verdict 哨兵(无结论兜底)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          PR='${{ github.event.pull_request.number }}'
+          REPO='${{ github.repository }}'
+          HEAD='${{ github.event.pull_request.head.sha }}'
+          FRESH=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            --jq '[.[] | select(.created_at > env.RUN_STARTED_AT and (.body | test("(?m)^VERDICT: (PASS|FAIL)\\s*$")))] | length')
+          if [ "$FRESH" -eq 0 ]; then
+            BODY=$(printf '⚠️ 审查未产出结论:本 run(head `%s`,起点 %s)结束前没有发出含 VERDICT 行的评论(轮数截断或发评论失败)。门禁不得沿用旧 head 的 verdict——请重跑审查。' "$HEAD" "$RUN_STARTED_AT")
+            gh pr comment "$PR" --repo "$REPO" --body "$BODY"
+            echo "::error::run 结束但无 VERDICT 评论——哨兵判红,防门禁读到旧 head 结论"
+            exit 1
+          fi
+          echo "哨兵通过:本 run 期间已发出 $FRESH 条含 VERDICT 的评论"

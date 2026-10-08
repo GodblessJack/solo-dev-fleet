@@ -1,0 +1,27 @@
+# CI 硬门禁:lint + test + build,main 与所有 PR 必须通过。
+# 这是整个协作流水线唯一的硬门禁;S3/S4 的合并判据只看这里。
+# 按你的技术栈改 run 命令(本示例为 Node 项目)。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: build + test + lint
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

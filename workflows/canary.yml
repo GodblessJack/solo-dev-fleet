@@ -1,0 +1,50 @@
+name: Runner Canary
+
+# runner 心跳强验证层:不信任 runner 的 online 状态——那只说明进程活着,
+# 不说明「能干活」和「挂了有人拉起」。每 30 分钟发 3 个并发 canary job,
+# 每台 runner 实例单并发 → 3 个 job 必然分布到三台;哪台挂,它的心跳就断。
+# 失败自动开 issue,不依赖有人去看 Actions 红叉
+# (分诊 workflow 曾连挂 4 天无人发现:红了没人看的信号等于没有信号)。
+on:
+  schedule:
+    # 每 30 分钟一场:GitHub schedule 实测会缺席/迟到 30 分钟+;
+    # 心跳一场缺席即数小时无覆盖,高频换取「最坏空窗 1 小时」
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    runs-on: self-hosted
+    timeout-minutes: 5
+    strategy:
+      max-parallel: 3
+      fail-fast: false   # 一个 slot 失败不许连坐取消其他 slot——每台都要测到
+      matrix:
+        slot: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain check
+        run: |
+          echo "canary slot ${{ matrix.slot }} @ $(hostname) $(date -u +%FT%TZ)"
+          node -v && npm -v && git --version
+          node -e "const p=require('./package.json'); console.log('pkg ok:', p.name, p.version)"
+
+      - name: Report failure as issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # REST 直发,不走 gh 的 GraphQL 预查询(defaultBranchRef 曾报 not accessible)
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues" \
+            -d "{\"title\":\"runner 心跳失败:canary slot ${{ matrix.slot }} @ $(date -u +%FT%TZ)\",\"body\":\"canary job 在 self-hosted runner 上失败。排查:1) 本 run 日志看失败步骤与主机名;2) 三 slot 单并发应分布三台实例,对照各 slot 的 hostname 判断哪台断;3) 该机器 systemctl --user status actions-runner-* 查 systemd 保活。修完在本单评论留证据闭环。\",\"labels\":[\"bug\",\"priority:p1\",\"from:canary\"]}" \
+            || echo "开单失败,至少本 run 的红可见"

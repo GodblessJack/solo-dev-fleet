@@ -1,0 +1,121 @@
+name: AI Triage
+
+# 云端分诊台:人类/批注通道提 issue 后自动核实、查重、补全、打标签,
+# 让 S2 fix-round 能自动认领。S1 提的单(from:qa + claude-ready,提单时已锚点自查)免分诊。
+on:
+  issues:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+  # 手动补票:gh workflow run triage.yml -f issue_number=N
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 要分诊的 issue 号
+        required: true
+        type: string
+
+concurrency:
+  group: triage-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    # 三种情形放行:1) 新建 issue 且非 @claude 单,且非「from:qa 且已带 claude-ready」的完工 QA 单 → 全量分诊
+    #   (修过的坑:from:qa 无差别跳过会吃掉「QA 类会话漏带 claude-ready」的单——triage 跳过、fix 不认 ready,
+    #    两不管悬空;只有 from:qa+claude-ready 双标齐才算提单时已自查,才免分诊)
+    # 2) needs-info issue 收到人类新评论(排除一切 bot)→ 重新分诊
+    # 3) 手动 dispatch 补票。其余(bot 评论、@claude、流水线单)一律跳过,防自触发死循环
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issues' && !(contains(github.event.issue.labels.*.name, 'from:qa') && contains(github.event.issue.labels.*.name, 'claude-ready')) && !contains(github.event.issue.body, '@claude')) || (github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'needs-info') && github.event.comment.user.type != 'Bot' && !contains(github.event.comment.body, '@claude'))
+    runs-on: self-hosted
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    env:
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
+      # 模型名收进 Secrets:切模型只改 secret,不动代码
+      ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_HAIKU_MODEL }}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_SONNET_MODEL }}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_OPUS_MODEL }}
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # npm 预装 Claude Code:action 自带 installer 从 claude.ai 下载,
+      # 可能被「App unavailable in region」拦截页挡住(curl 拿回 HTML,bash 解析炸)——
+      # 曾有分诊因此连挂多天;改走 npm 源。路径改成你 runner 上的实际 node bin 目录。
+      - name: Install Claude Code
+        run: |
+          CLAUDE_BIN=$HOME/.local/bin/claude
+          if [ -x "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+            echo "claude 已在位,跳过安装(防多 runner 并发装同一 bin 撞 ETXTBSY)"
+          else
+            flock /tmp/claude-npm-install.lock -c 'npm install -g @anthropic-ai/claude-code'
+          fi
+
+      - name: Triage issue
+        uses: anthropics/claude-code-action@v1
+        with:
+          # github_token 显式传入:绕开 App token exchange 在自托管 runner 上的 403(实测)
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 指定预装 CLI 路径:action 检测到该输入即跳过自带下载安装
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
+          prompt: |
+            你是本仓的分诊台。分诊 issue #${{ env.ISSUE_NUMBER }},全程只用 gh CLI 和只读工具,禁止修改任何代码、禁止创建分支/PR。
+
+            背景约定(分诊前必读):
+            - 项目宪法 CLAUDE.md;术语口径 CONTEXT.md(如有);架构决策 docs/adr/(如有)
+            - 标签契约:S2 修复流水线只认 bug + claude-ready(且无 status:doing/question/needs-info/deferred:external)才会自动认领
+            - 模块标签:本仓 mod:* 系列(先 gh label list 看实际有哪些,选一个)
+
+            第一步·读取现状:gh issue view $ISSUE_NUMBER --json title,body,labels,comments(issue_comment 触发时重点读最新评论)。
+
+            图片阅读(重要):正文/评论含图片链接时,按链接类型取图后用 Read 工具查看——批注单的截图里常有框选高亮,是关键证据:
+            - 本仓 blob 链接(github.com/OWNER/REPO/blob/<ref>/<path>):**私有仓无凭证 curl 拉不动(会拉回登录页 HTML)**,必须走 gh api:`gh api "repos/OWNER/REPO/contents/<path>?ref=<ref>" --jq .content | base64 -d > /tmp/triage-img.png`;
+            - user-attachments 外链:`curl -sL <url> -o /tmp/triage-img.png`。
+            若取图或 Read 仍失败,在报告中注明「含图未读」并倾向 needs-info 追问文字描述,**绝不假装看过图**。
+
+            第二步·查重(三层防线之第二、三层,结构化锚点优先):
+            结构化锚点 = mod 标签 + 涉及文件/工具名 + 复现路径。先 gh issue list --state open 全量扫,再按标题关键词 search 已关闭单。三种结论:
+            A. 高置信重复(锚点与某个 open 单完全一致:同模块、同代码位置/工具名、同复现路径)→ 允许自动合并:gh issue close $ISSUE_NUMBER,评论附完整证据链(重复于 #N、锚点比对表)+「若误关请直接回复,会重新打开」,打 duplicate-candidate 标签留痕,结束。
+            B. 低置信疑似(锚点不全同,仅现象描述疑似)→ 评论贴出疑似单链接与理由,打 duplicate-candidate,**不关闭**,等人工确认,结束。
+            C. 同根因但验证路径不同(如一个报 API 报错、一个报界面现象)→ 不关闭:选定信息更全的一单为根因 issue,在其正文「关联现象清单」追加本单现象(没有清单则新建该段),两单互相评论链接,本单打 from:human + 相应 mod 标签,继续走第四步分流。
+            旁支:疑似「已修复的过期反馈」→ 必须同时满足两个客观条件才可自动关闭:① 反馈指向的行为在当前代码中已不存在(Grep 实证,引用 文件:行号);② 找到已合入 main 的修复 PR/commit。满足 → 打 auto-closed,评论附证据链+「若误关请直接回复重开」,然后 close;任一不满足 → 退化为 B 档。带 auto-closed 标签被 reopened 的单 → 永不再自动关,打 question 等人工裁决。
+
+            第三步·核实(只读探查仓库):按 issue 描述定位代码(文件:行号),对照项目文档判断类型。探查预算:总工具调用不超过 12 次;大范围诉求只抽 3~5 个代表性样本并注明口径。根因在外部服务/额度/第三方的 → 打 deferred:external + 相应 mod 标签,评论说明挂起原因,结束。
+
+            第四步·分流,四选一:
+            A. 信息不足 → 评论追问具体缺失(哪个界面/接口?做了什么操作?看到什么?期望什么?),打 needs-info,结束。绝不脑补复现步骤。
+            B. 确认是缺陷 → 正文追加「## 🤖 AI 核实报告」(追加不删改原文:gh issue view 取原文拼接后 gh issue edit --body-file 写回),含:涉及接口/路由、疑似代码位置(文件:行号)、复现步骤、建议修复方向。打标签:bug + claude-ready + priority:p0|p1|p2 + mod:*(一个)。
+            C. 功能缺口/改进建议 → 追加核实报告(可省复现步骤),打 enhancement + mod:*,不打 priority/claude-ready(排期由人定)。
+            D. 基线冲突/需求歧义 → 追加报告说明两种口径各自依据,打 question,等人裁决。
+
+            优先级口径:p0 = 阻断主流程/数据损坏;p1 = 功能明显不符但有绕行;p2 = 体验/文案/边界问题。
+
+            issue_comment 触发(补充信息重分诊):信息已补齐 → --remove-label needs-info 后按 B/C/D 走;仍不够 → 继续追问。
+
+            收尾:无论走哪条分支,最后发一条简短评论说明分诊结论(分类、标签、下一步谁接手)。
+            **顺序纪律(血泪教训)**:若 issue 很长(多条目/大量证据/多个候选重复项),**先**把结论与标签落定并发出评论,**再**按需深挖;不要为了穷尽细节拖到最后才收尾——撞轮数上限会让整个分诊作废(实测:43 轮干完了活却被 40 上限判失败,标签与评论全部没落地,还多开一张告警单)。
+          claude_args: '--max-turns 80 --allowedTools "Read,Glob,Grep,Bash(gh issue:*),Bash(gh label:*),Bash(gh search:*),Bash(gh api:*),Bash(curl:*)"'
+
+      # 失败自动开单:分诊失败若只躺 Actions 红叉,没人看等于没信号
+      # (曾连挂 4 天无人发现的教训)。开成 issue 才会进队列、被巡检看见
+      - name: Report failure as issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            -t "AI 分诊失败:issue #$ISSUE_NUMBER @ $(date -u +%FT%TZ)" \
+            -b "分诊 run 失败(安装层或 LLM 层)。排查:\`gh run view <本run> --log-failed\`。注意安装层曾修过一版(npm 预装替换官方 installer 绕区域拦截)——若再挂,先看失败在哪个步骤。原待分诊单 #$ISSUE_NUMBER 可能因此没拿到 claude-ready,修复后用 \`gh workflow run triage.yml -f issue_number=$ISSUE_NUMBER\` 补票。" \
+            -l bug -l priority:p1 || echo "开单失败,至少本 run 的红可见"

@@ -1,0 +1,61 @@
+name: Model Health
+
+# 模型层健康探针:手动触发,分层定位云端 workflow 的模型故障。
+# L0 Secrets 存在性 → L1 裸 curl 验凭证/端点可达 → L2 直跑 Claude CLI 验端点兼容。
+# 输出结论:哪层坏了、该查什么。换端点/换 key 后跑一次本探针即完成验证。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    env:
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
+      # 模型名收进 Secrets:切模型只改 secret,不动代码
+      ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_HAIKU_MODEL }}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_SONNET_MODEL }}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_OPUS_MODEL }}
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    steps:
+      - name: L0 Secrets 存在性
+        run: |
+          [ -n "$ANTHROPIC_BASE_URL" ] && echo "BASE_URL 已配置: $ANTHROPIC_BASE_URL" || { echo "❌ L0: ANTHROPIC_BASE_URL secret 缺失"; exit 1; }
+          [ -n "$ANTHROPIC_AUTH_TOKEN" ] && echo "API KEY 已配置(长度 ${#ANTHROPIC_AUTH_TOKEN})" || { echo "❌ L0: ANTHROPIC_API_KEY secret 缺失"; exit 1; }
+          [ -n "$ANTHROPIC_MODEL" ] && echo "MODEL 已配置: $ANTHROPIC_MODEL (haiku=$ANTHROPIC_DEFAULT_HAIKU_MODEL)" || { echo "❌ L0: ANTHROPIC_MODEL 等模型 secret 缺失"; exit 1; }
+
+      - name: L1 裸 curl 验凭证与端点
+        run: |
+          code=$(curl -sS -o /tmp/l1.json -w '%{http_code}' --max-time 30 \
+            -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
+            -H "content-type: application/json" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+            -H "x-api-key: $ANTHROPIC_AUTH_TOKEN" \
+            -d "{\"model\":\"$ANTHROPIC_DEFAULT_HAIKU_MODEL\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" || echo CURL_FAIL)
+          echo "HTTP $code"; head -c 500 /tmp/l1.json || true
+          case "$code" in
+            200) echo "✅ L1 通过:端点可达且凭证有效";;
+            401|403) echo "❌ L1 失败:凭证无效/权限不足——检查 ANTHROPIC_API_KEY secret"; exit 1;;
+            404) echo "❌ L1 失败:/v1/messages 不存在——检查 ANTHROPIC_BASE_URL 是否 Anthropic 兼容端点"; exit 1;;
+            429) echo "❌ L1 失败:429 限流/配额耗尽——等限额重置或换通道;配额耗尽期间探针必须红(曾有探针假绿漏报死锁)"; exit 1;;
+            CURL_FAIL) echo "❌ L1 失败:网络不可达——检查 BASE_URL 与 runner 出网"; exit 1;;
+            *) echo "⚠️ L1 异常码 $code——模型名可能不被端点接受(用 API 裸名),看上面响应体";;
+          esac
+
+      - name: L2 直跑 Claude CLI 验端点兼容
+        run: |
+          CLAUDE_BIN=$HOME/.local/bin/claude
+          if [ -x "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+            echo "claude CLI 已在位,跳过安装(防多 runner 并发装同一 bin 撞 ETXTBSY)"
+          else
+            flock /tmp/claude-npm-install.lock -c 'npm install -g @anthropic-ai/claude-code --silent'
+          fi
+          # pipefail:管道退出码取最右非零者,防 tail 吞掉 claude 的失败退出码(探针假绿坑)
+          set -o pipefail
+          timeout 120 claude -p "回复 ok 两个字母即可" --max-turns 1 2>&1 | tail -5 \
+            && echo "✅ L2 通过:CLI 与端点协议兼容" \
+            || { echo "❌ L2 失败:CLI 层报错——L1 通而 L2 不通通常是端点与 CLI 的协议兼容问题(如必须 Bearer 而非 x-api-key,或模型名不被接受)"; exit 1; }
